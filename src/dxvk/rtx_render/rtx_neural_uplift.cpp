@@ -22,6 +22,7 @@
 #include "rtx_neural_uplift.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
@@ -30,7 +31,77 @@
 #include "rtx_ngx_wrapper.h"
 #include "rtx_options.h"
 
+#include "../../util/util_once.h"
+
 namespace dxvk {
+
+  namespace {
+    VkExtent3D scaleExtent(const VkExtent3D& extent, float scale) {
+      return {
+        std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(extent.width) * scale))),
+        std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(extent.height) * scale))),
+        1 };
+    }
+
+    VkImageBlit makeBlitRegion(const VkExtent3D& srcExtent, const VkExtent3D& dstExtent) {
+      const VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+
+      VkImageBlit region;
+      region.srcSubresource = layers;
+      region.srcOffsets[0] = { 0, 0, 0 };
+      region.srcOffsets[1] = { static_cast<int32_t>(srcExtent.width), static_cast<int32_t>(srcExtent.height), 1 };
+      region.dstSubresource = layers;
+      region.dstOffsets[0] = { 0, 0, 0 };
+      region.dstOffsets[1] = { static_cast<int32_t>(dstExtent.width), static_cast<int32_t>(dstExtent.height), 1 };
+      return region;
+    }
+
+    // An execution and memory dependency that leaves the image in the layout DXVK tracks it in. The
+    // blits below go through DxvkContext::blitImage, which does its own layout handling but only
+    // orders against the stages each image declares - and these render targets do not declare
+    // transfer. So the hazards on either side of each blit are spelled out with these.
+    void accessInPlace(DxvkBarrierSet& barriers,
+                       const Resources::Resource& resource,
+                       VkPipelineStageFlags srcStages,
+                       VkAccessFlags srcAccess,
+                       VkPipelineStageFlags dstStages,
+                       VkAccessFlags dstAccess) {
+      barriers.accessImage(
+        resource.image,
+        resource.view->imageSubresources(),
+        resource.image->info().layout,
+        srcStages,
+        srcAccess,
+        resource.image->info().layout,
+        dstStages,
+        dstAccess);
+    }
+
+    NGXNeuralUpliftContext::NGXSettings makeSettings(bool resetAccumulation, bool depthInverted) {
+      NGXNeuralUpliftContext::NGXSettings settings;
+      // Clamped here rather than left to the snippet, which silently pins anything above 2 to 2 - so
+      // an out-of-range value would otherwise read in the UI as a style that is not applied.
+      settings.style = static_cast<uint32_t>(std::clamp(DxvkNeuralUplift::style(), 0, kNeuralUpliftMaxStyle));
+      settings.intensity = DxvkNeuralUplift::intensity();
+      settings.styleStrength = std::clamp(DxvkNeuralUplift::styleStrength(), 0.0f, 1.0f);
+      settings.localStructureStrength = DxvkNeuralUplift::localStructureStrength();
+      // Passed through unclamped: -1 is a meaningful sentinel, not an out-of-range value.
+      settings.skinStructureStrength = DxvkNeuralUplift::skinStructureStrength();
+      settings.autoMask = DxvkNeuralUplift::autoMask();
+      settings.resetAccumulation = resetAccumulation;
+      settings.depthInverted = depthInverted;
+      // A zero scale is not "no motion vectors", it is a motion field that says nothing moved, which
+      // is worse than either alternative: the snippet still reprojects, and does it through a history
+      // that never lines up with the frame. The option can arrive at 0 from a config file or an
+      // environment variable as well as the UI, so it is caught here rather than only being made
+      // unreachable in the panel.
+      const float motionVectorScale = DxvkNeuralUplift::motionVectorScale();
+      const float sanitizedMotionVectorScale = motionVectorScale != 0.0f ? motionVectorScale : 1.0f;
+      settings.motionVectorScale[0] = sanitizedMotionVectorScale;
+      settings.motionVectorScale[1] = sanitizedMotionVectorScale;
+      return settings;
+    }
+  }
 
   DxvkNeuralUplift::DxvkNeuralUplift(DxvkDevice* device)
     : CommonDeviceObject(device)
@@ -60,6 +131,8 @@ namespace dxvk {
     m_recreate = true;
     m_evaluatedLastFrame = false;
     m_intermediateColor.reset();
+    m_workColor.reset();
+    m_workOutput.reset();
 
     // Drop the context entirely rather than just the feature: it owns the loaded snippet and its
     // NGX init, and bypassCallerCheck is applied at load time.
@@ -77,6 +150,8 @@ namespace dxvk {
 
   void DxvkNeuralUplift::releaseTargetResource() {
     m_intermediateColor.reset();
+    m_workColor.reset();
+    m_workOutput.reset();
   }
 
   void DxvkNeuralUplift::onDeactivation() {
@@ -97,6 +172,35 @@ namespace dxvk {
       useLinearDepth() ? &rtOutput.m_primaryLinearViewZ : &rtOutput.m_primaryDepth;
 
     return depth->image != nullptr ? depth : nullptr;
+  }
+
+  bool DxvkNeuralUplift::supportsLinearBlit(VkFormat format) const {
+    constexpr VkFormatFeatureFlags required =
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+
+    return (m_device->adapter()->formatProperties(format).optimalTilingFeatures & required) == required;
+  }
+
+  void DxvkNeuralUplift::acquireReadOnlyInputs(DxvkBarrierSet& barriers,
+                                               const Resources::Resource* depth,
+                                               const Resources::Resource* motionVectors) const {
+    const Resources::Resource* readOnlyInputs[] = { motionVectors, depth };
+
+    for (const Resources::Resource* input : readOnlyInputs) {
+      if (input == nullptr || input->view == nullptr) {
+        continue;
+      }
+
+      barriers.accessImage(
+        input->image,
+        input->view->imageSubresources(),
+        input->image->info().layout,
+        input->image->info().stages,
+        input->image->info().access,
+        input->image->info().layout,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+    }
   }
 
   void DxvkNeuralUplift::initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent) {
@@ -196,6 +300,20 @@ namespace dxvk {
 
     const VkExtent3D outputExtent = inOutColor.image->info().extent;
 
+    // Below 1 the network runs on a downsampled copy of the frame (see workScale). A NaN from a
+    // config file fails the comparison and so runs at full size rather than at some arbitrary one.
+    const float scale = std::clamp(workScale(), kNeuralUpliftMinWorkScale, 1.0f);
+    bool atWorkScale = scale < 0.999f;
+
+    if (atWorkScale && !supportsLinearBlit(inOutColor.image->info().format)) {
+      ONCE(Logger::warn("[DLSS-NR] The output format does not support linear blits; ignoring workScale "
+                        "and running Neural Uplift at the output resolution."));
+      atWorkScale = false;
+    }
+
+    // The feature is created at the size the network actually runs at.
+    const VkExtent3D featureExtent = atWorkScale ? scaleExtent(outputExtent, scale) : outputExtent;
+
     // bypassCallerCheck is applied when the snippet is loaded, not when the feature is created, so
     // changing it has to drop the whole context and load again.
     if (m_createdBypassCallerCheck != bypassCallerCheck() && m_contextCreationAttempted) {
@@ -207,17 +325,33 @@ namespace dxvk {
     m_recreate |= (m_createdPreset != preset())
       || (m_createdFeatureId != featureId())
       || (m_createdDepthInverted != effectiveDepthInverted())
-      || (m_createdExtent.width != outputExtent.width)
-      || (m_createdExtent.height != outputExtent.height);
+      || (m_createdExtent.width != featureExtent.width)
+      || (m_createdExtent.height != featureExtent.height);
 
     if (m_recreate) {
-      initializeFeature(ctx, outputExtent);
+      initializeFeature(ctx, featureExtent);
       m_recreate = false;
     }
 
     if (!m_context || !m_context->isNeuralUpliftInitialized()) {
       return;
     }
+
+    if (atWorkScale) {
+      const bool evaluated = dispatchAtWorkScale(ctx, barriers, inOutColor, depth, motionVectors, featureExtent, resetHistory);
+
+      // Same reasoning as the full-resolution path below.
+      m_forceHistoryReset = !evaluated;
+      m_evaluatedLastFrame = evaluated;
+      m_statusReason = evaluated ? "active" : "evaluate failed";
+      return;
+    }
+
+    // Full resolution from here on, so the work-scale images are not needed. The command list still
+    // holds references to them if the last frame used them.
+    m_workColor.reset();
+    m_workOutput.reset();
+    m_lastWorkExtent = { 0, 0, 0 };
 
     // RtxPass sizes the staging copy from the target extent on activation and on resize; this
     // covers the case where the colour it is actually handed disagrees, as a format change would.
@@ -275,23 +409,7 @@ namespace dxvk {
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_ACCESS_SHADER_READ_BIT);
 
-    const Resources::Resource* readOnlyInputs[] = { motionVectors, depth };
-
-    for (const Resources::Resource* input : readOnlyInputs) {
-      if (input == nullptr || input->view == nullptr) {
-        continue;
-      }
-
-      barriers.accessImage(
-        input->image,
-        input->view->imageSubresources(),
-        input->image->info().layout,
-        input->image->info().stages,
-        input->image->info().access,
-        input->image->info().layout,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_READ_BIT);
-    }
+    acquireReadOnlyInputs(barriers, depth, motionVectors);
 
     barriers.accessImage(
       inOutColor.image,
@@ -311,26 +429,8 @@ namespace dxvk {
     buffers.pInDepth = depth;
     buffers.pInMotionVectors = motionVectors;
 
-    NGXNeuralUpliftContext::NGXSettings settings;
-    // Clamped here rather than left to the snippet, which silently pins anything above 2 to 2 - so
-    // an out-of-range value would otherwise read in the UI as a style that is not applied.
-    settings.style = static_cast<uint32_t>(std::clamp(style(), 0, kNeuralUpliftMaxStyle));
-    settings.intensity = intensity();
-    settings.styleStrength = std::clamp(styleStrength(), 0.0f, 1.0f);
-    settings.localStructureStrength = localStructureStrength();
-    // Passed through unclamped: -1 is a meaningful sentinel, not an out-of-range value.
-    settings.skinStructureStrength = skinStructureStrength();
-    settings.autoMask = autoMask();
-    settings.resetAccumulation = resetHistory || m_forceHistoryReset;
-    settings.depthInverted = m_createdDepthInverted;
-    // A zero scale is not "no motion vectors", it is a motion field that says nothing moved, which
-    // is worse than either alternative: the snippet still reprojects, and does it through a history
-    // that never lines up with the frame. The option can arrive at 0 from a config file or an
-    // environment variable as well as the UI, so it is caught here rather than only being made
-    // unreachable in the panel.
-    const float sanitizedMotionVectorScale = motionVectorScale() != 0.0f ? motionVectorScale() : 1.0f;
-    settings.motionVectorScale[0] = sanitizedMotionVectorScale;
-    settings.motionVectorScale[1] = sanitizedMotionVectorScale;
+    const NGXNeuralUpliftContext::NGXSettings settings =
+      makeSettings(resetHistory || m_forceHistoryReset, m_createdDepthInverted);
 
     const NVSDK_NGX_Result evaluateResult = m_context->evaluate(ctx, buffers, settings);
     const bool evaluated = NVSDK_NGX_SUCCEED(evaluateResult);
@@ -365,6 +465,137 @@ namespace dxvk {
     m_statusReason = evaluated ? "active" : "evaluate failed";
   }
 
+  bool DxvkNeuralUplift::dispatchAtWorkScale(RtxContext* ctx,
+                                             DxvkBarrierSet& barriers,
+                                             const Resources::Resource& inOutColor,
+                                             const Resources::Resource* depth,
+                                             const Resources::Resource* motionVectors,
+                                             const VkExtent3D& workExtent,
+                                             bool resetHistory) {
+    const VkExtent3D outputExtent = inOutColor.image->info().extent;
+    const VkFormat format = inOutColor.image->info().format;
+
+    // The network reads its own downsampled copy here, so its input and output never alias and
+    // the full-resolution staging copy is not needed.
+    m_intermediateColor.reset();
+    m_lastWorkExtent = workExtent;
+
+    const auto matchesWork = [&](const Resources::Resource& resource) {
+      return resource.image != nullptr
+        && resource.image->info().extent.width == workExtent.width
+        && resource.image->info().extent.height == workExtent.height
+        && resource.image->info().format == format;
+    };
+
+    if (!matchesWork(m_workColor) || !matchesWork(m_workOutput)) {
+      // createImageResource adds storage usage to the default sampled + transfer src/dst, which
+      // covers both blits and the snippet writing its output.
+      Rc<DxvkContext> dxvkCtx = ctx;
+      m_workColor = Resources::createImageResource(dxvkCtx, "neural uplift work color", workExtent, format);
+      m_workOutput = Resources::createImageResource(dxvkCtx, "neural uplift work output", workExtent, format);
+    }
+
+    const Rc<DxvkCommandList>& cmdList = ctx->getCommandList();
+    const VkComponentMapping identity = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+
+    // Downsample the finished frame into the network's input. Both images come from their tracked
+    // scope; transfer is added to the sources to cover last frame's blits, which that scope omits.
+    accessInPlace(barriers, inOutColor,
+                  inOutColor.image->info().stages | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  inOutColor.image->info().access | VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_READ_BIT);
+    accessInPlace(barriers, m_workColor,
+                  m_workColor.image->info().stages | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  m_workColor.image->info().access | VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT);
+    barriers.recordCommands(cmdList);
+
+    ctx->blitImage(m_workColor.image, identity, inOutColor.image, identity,
+                   makeBlitRegion(outputExtent, workExtent), VK_FILTER_LINEAR);
+
+    // Into the snippet's compute scope: the downsampled input is read, the output is written, and
+    // the output was last read by the upsample blit of the previous frame.
+    accessInPlace(barriers, m_workColor,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT);
+    accessInPlace(barriers, m_workOutput,
+                  m_workOutput.image->info().stages | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  m_workOutput.image->info().access | VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_WRITE_BIT);
+    acquireReadOnlyInputs(barriers, depth, motionVectors);
+    barriers.recordCommands(cmdList);
+
+    NGXNeuralUpliftContext::NGXBuffers buffers;
+    buffers.pInColor = &m_workColor;
+    buffers.pInOutput = &m_workOutput;
+    buffers.pInDepth = depth;
+    buffers.pInMotionVectors = motionVectors;
+
+    const NGXNeuralUpliftContext::NGXSettings settings =
+      makeSettings(resetHistory || m_forceHistoryReset, m_createdDepthInverted);
+
+    const bool evaluated = NVSDK_NGX_SUCCEED(m_context->evaluate(ctx, buffers, settings));
+
+    // Hand the input back to its tracked scope, ready for the next frame's downsample.
+    accessInPlace(barriers, m_workColor,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT,
+                  m_workColor.image->info().stages,
+                  m_workColor.image->info().access);
+
+    if (evaluated) {
+      // Upsample the result over the frame. The frame was read by the downsample, so this write
+      // has to wait for that as well as for the snippet's output.
+      accessInPlace(barriers, m_workOutput,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT);
+      accessInPlace(barriers, inOutColor,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT);
+      barriers.recordCommands(cmdList);
+
+      ctx->blitImage(inOutColor.image, identity, m_workOutput.image, identity,
+                     makeBlitRegion(workExtent, outputExtent), VK_FILTER_LINEAR);
+
+      // Back to the frame's tracked scope, plus transfer for anything downstream that copies it.
+      accessInPlace(barriers, inOutColor,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    inOutColor.image->info().stages | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    inOutColor.image->info().access | VK_ACCESS_TRANSFER_READ_BIT);
+    } else {
+      // A rejected evaluation leaves the output undefined, so the frame is left as it was rather
+      // than overwritten with it.
+      accessInPlace(barriers, m_workOutput,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    m_workOutput.image->info().stages,
+                    m_workOutput.image->info().access);
+    }
+
+    barriers.recordCommands(cmdList);
+
+    // NGX captured the raw VkImageViews, so the views have to be kept alive as well as the images;
+    // see the full-resolution path.
+    cmdList->trackResource<DxvkAccess::None>(m_workColor.view);
+    cmdList->trackResource<DxvkAccess::Read>(m_workColor.image);
+    cmdList->trackResource<DxvkAccess::None>(m_workOutput.view);
+    cmdList->trackResource<DxvkAccess::Write>(m_workOutput.image);
+
+    return evaluated;
+  }
+
   void DxvkNeuralUplift::showImguiStatusLine() {
     if (!isSupported()) {
       const std::string& reason = m_device->getCommon()->metaNGXContext().getNeuralUpliftNotSupportedReason();
@@ -375,6 +606,10 @@ namespace dxvk {
 
     ImGui::Text("Neural Uplift: %s (feature id %d, preset %d, inits %u)",
                 m_statusReason, featureId(), preset(), m_initCount);
+
+    if (enable() && m_lastWorkExtent.width != 0) {
+      ImGui::Text("Network resolution: %ux%u", m_lastWorkExtent.width, m_lastWorkExtent.height);
+    }
 
     // With neither depth nor motion vectors the snippet has nothing to reproject through and runs
     // as a purely spatial filter, which is a different effect from the one it is meant to produce.
@@ -414,6 +649,14 @@ namespace dxvk {
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Blend of the enhanced image against the original. Below 1 the snippet keeps\n"
                         "an extra copy of the input to blend against, so it also costs slightly more.");
+    }
+
+    RemixGui::DragFloat("Work Scale", &workScaleObject(), 0.01f, kNeuralUpliftMinWorkScale, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Fraction of the output resolution, per axis, that the network runs at. Its cost\n"
+                        "scales with the pixels it processes, so this is the main performance control.\n"
+                        "Below 1 the frame is downsampled, enhanced and upsampled back, which softens\n"
+                        "native detail in proportion. 1 runs it on the output directly.");
     }
 
     RemixGui::Checkbox("Auto Mask", &autoMaskObject());
