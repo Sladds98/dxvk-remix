@@ -739,6 +739,15 @@ namespace dxvk {
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
         dispatchToneMapping(rtOutput, performSRGBConversion);
 
+        // Neural Uplift anchors here and nowhere else. The model is LDR-clamped and trained on
+        // tonemapped, display-encoded frames, and in this pipeline the tone mapper applies the sRGB
+        // encode itself, so this is the first point where such a frame exists. Before the screen
+        // overlay, so the UI is not fed through the model. The pre-tonemap debug view skips tone
+        // mapping, and the encode with it, so that frame is not display-encoded either.
+        const bool neuralUpliftInputEncoded = performSRGBConversion
+          && m_common->metaDebugView().debugViewIdx() != DEBUG_VIEW_PRE_TONEMAP_OUTPUT;
+        dispatchNeuralUplift(rtOutput, neuralUpliftInputEncoded);
+
         // Composite screen overlay (from external C API) after tone mapping, before screenshot capture.
         dispatchScreenOverlay(rtOutput);
 
@@ -1689,6 +1698,20 @@ namespace dxvk {
   void RtxContext::dispatchRayReconstruction(const Resources::RaytracingOutput& rtOutput) {
     DxvkRayReconstruction& rayReconstruction = m_common->metaRayReconstruction();
     rayReconstruction.dispatch(this, m_execBarriers, rtOutput, m_resetHistory, GlobalTime::get().deltaTimeMs());
+  }
+
+  void RtxContext::dispatchNeuralUplift(const Resources::RaytracingOutput& rtOutput,
+                                        bool displayEncoded) {
+    ScopedCpuProfileZone();
+
+    if (!m_common->metaNeuralUplift().isActive()) {
+      return;
+    }
+
+    spillRenderPass(false);
+    unbindComputePipeline();
+
+    m_common->metaNeuralUplift().dispatch(this, m_execBarriers, rtOutput, displayEncoded, m_resetHistory);
   }
 
   void RtxContext::dispatchNIS(const Resources::RaytracingOutput& rtOutput) {
