@@ -187,6 +187,27 @@ check will enforce it if discipline slips.
 
 ---
 
+## src/dxvk/dxvk_device.cpp
+
+**Category:** index-only
+
+- **Inline tweak** at `DxvkObjects::DxvkObjects` initializer list — 1 LOC: `m_neuralUplift(device)`.
+  *Constructs the Neural Uplift pass: DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`.*
+
+- **Inline tweak** at `DxvkObjects::onDestroy` — 1 LOC: `m_neuralUplift.get().onDestroy()`.
+  *Releases the Neural Uplift NGX feature while the device is still alive, next to the other NGX passes.*
+
+---
+
+## src/dxvk/dxvk_objects.h
+
+**Category:** index-only
+
+- **Inline tweak** at includes, forward declarations, `DxvkObjects` accessors and members — ~7 LOC.
+  *Adds `#include "rtx_render/rtx_neural_uplift.h"`, `class DxvkNeuralUplift;`, `metaNeuralUplift()` and `Active<DxvkNeuralUplift> m_neuralUplift` for the Neural Uplift pass (DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`).*
+
+---
+
 ## src/dxvk/dxvk_limits.h
 
 **Category:** index-only
@@ -226,6 +247,13 @@ check will enforce it if discipline slips.
 
 - **Inline tweak** at `ImGUI::showRenderingSettings` "Tonemapping" header — removed the `Tonemapping Mode` combo (Global / Local / Direct) and the standalone "User Brightness" / "User Brightness EV Range" sliders. The header body is now a single always-visible `metaToneMapping().showImguiSettings()` call between two separators. Tuning Mode (tone curve sliders) is also removed from the panel.
   *2026-05-13 tonemap refactor: mode selector removed; operator dropdown is now the primary control. 2026-05-15: local tonemap path removed entirely, so no per-path UI gate remains.*
+
+
+- **Inline tweak** at the frame-pass-stage name table — 1 LOC: `{ RtxFramePassStage::NeuralUplift, "NeuralUplift" }`.
+  *Names the Neural Uplift frame pass stage (DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`).*
+
+- **Inline tweak** at `ImGUI::showRenderingSettings` upscaler section (after "Resolution scale") — ~11 LOC.
+  *"Neural Uplift (DLSS-NR)" collapsing header that calls `metaNeuralUplift().showImguiSettings()`.*
 
 ---
 
@@ -291,6 +319,10 @@ initializer list and can't be lifted into a separate TU.
 - **Inline tweak** at `dxvk_src` files list (rtx_render block) — 2-line addition registering weather sources.
   *Registers `'rtx_render/rtx_fork_weather.cpp'` and `'rtx_render/rtx_fork_weather.h'` in the DXVK build source list.*
 
+
+- **Inline tweak** at `dxvk_src` files list (rtx_render block) — 3-line addition registering Neural Uplift sources.
+  *Registers `rtx_render/rtx_neural_uplift.cpp`, `rtx_render/rtx_neural_uplift.h` and `rtx_render/nvsdk_ngx_defs_dlssnr.h`.*
+
 ---
 
 ## src/dxvk/rtx_render/graph/rtx_component_list.h
@@ -349,6 +381,13 @@ initializer list and can't be lifted into a separate TU.
 - **Hook** at `RtxContext` per-frame entry (weather blender update) — `fork_hooks::updateWeatherBlender` in `rtx_fork_weather.cpp`.
   *Calls `fork_hooks::updateWeatherBlender(*this, GlobalTime::get().deltaTime())` once per frame so the blender can read trigger keys, advance the lerp timeline, and write blended values to the Derived RTX_OPTION layer.*
 
+
+- **Inline tweak** at the post-processing chain in `RtxContext::injectRTX`, between `dispatchToneMapping` and `dispatchScreenOverlay` — ~8 LOC.
+  *Calls `dispatchNeuralUplift(rtOutput, neuralUpliftInputEncoded)`. On `main` the tone mapper applies the sRGB encode itself (the `gta4-atmos-dlss5` line has a separate sRGB-dither pass), so the pass anchors straight after tone mapping; the pre-tonemap debug view reports the frame as not display-encoded. DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`.*
+
+- **Inline tweak** at `RtxContext::dispatchNeuralUplift` (new method) — ~14 LOC.
+  *Spills the render pass, unbinds compute and forwards to `DxvkNeuralUplift::dispatch` with `m_execBarriers` and `m_resetHistory`.*
+
 ---
 
 ## src/dxvk/rtx_render/rtx_context.h
@@ -376,6 +415,10 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `RtxContext` class body (friend declarations block) — ~1 LOC addition to the existing friend block.
   *Adds `friend void fork_hooks::updateWeatherBlender(RtxContext&, float);` so the hook can access the private `m_weatherBlender` member.*
+
+
+- **Inline tweak** at `RtxContext` dispatch declarations — 1 LOC: `void dispatchNeuralUplift(const Resources::RaytracingOutput& rtOutput, bool displayEncoded);`.
+  *Neural Uplift dispatch (see `rtx_context.cpp`).*
 
 ---
 
@@ -520,6 +563,24 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** at `RtLight` struct (~line 645) — 1-line addition of `ignoreViewModel` field.
   *Adds `bool ignoreViewModel = false` member to `RtLight` to carry the per-light view-model exclusion flag across the GPU data write.*
+
+---
+
+## src/dxvk/rtx_render/rtx_ngx_wrapper.cpp
+
+**Category:** migrate
+
+- **Block** at the NGX wrapper — ~535 LOC: `NGXContext::supportsNeuralUplift` / `createNeuralUpliftContext`, and the `NGXNeuralUpliftContext` implementation, which loads `nvngx_dlssnr.dll` itself, redirects the snippet's `GetModuleFileNameW` import for its caller check, and creates / evaluates / releases the feature through the snippet's exports.
+  *DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`. Well over the inline cap: if that line never reaches `main`, move `NGXNeuralUpliftContext` into a fork-owned `rtx_fork_neural_uplift_ngx.cpp/h`.*
+
+---
+
+## src/dxvk/rtx_render/rtx_ngx_wrapper.h
+
+**Category:** migrate
+
+- **Block** at `NGXContext` and file scope — ~135 LOC: `#include "nvsdk_ngx_defs_dlssnr.h"`, the Neural Uplift probe / support members on `NGXContext`, and the `NGXNeuralUpliftContext` class declaration.
+  *DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`. Same follow-up as the `.cpp`.*
 
 ---
 
@@ -826,6 +887,15 @@ initializer list and can't be lifted into a separate TU.
 
 - **Inline tweak** — remove `rtx.tonemap.finalizeWithACES` RtxOption (superseded by `rtx.tonemap.tonemapOperator` in `rtx_fork_tonemap.cpp`); add `#include "rtx_fork_tonemap.h"`.
   *Adopts the fork operator enum.*
+
+---
+
+## src/dxvk/rtx_render/rtx_types.h
+
+**Category:** index-only
+
+- **Inline tweak** at `enum class RtxFramePassStage` — 1 LOC: `NeuralUplift` between `ToneMapping` and `FrameEnd`.
+  *Frame pass stage for the Neural Uplift pass (DLSS 5 Neural Uplift (DLSS-NR), ported from Kim2091's `gta4-atmos-dlss5` line (a17f313c, f9688d60, 10fa0368, 5e54f7bc) in the shape it has there, so the port merges cleanly if that line reaches `main`).*
 
 ---
 
