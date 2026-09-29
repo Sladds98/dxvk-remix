@@ -33,6 +33,10 @@ namespace dxvk {
   // higher to the last one, so offering more would present three duplicates of style 2.
   constexpr int kNeuralUpliftMaxStyle = 2;
 
+  // Lowest workScale offered. A third of the output per axis is already a ninth of the pixels, and
+  // below that the upsample back to the output softens the frame more than the network adds.
+  constexpr float kNeuralUpliftMinWorkScale = 0.33f;
+
   class DxvkDevice;
   class DxvkContext;
   class DxvkBarrierSet;
@@ -133,6 +137,17 @@ namespace dxvk {
                     args.environment = "RTX_NEURAL_UPLIFT_INTENSITY",
                     args.flags = RtxOptionFlags::UserSetting);
 
+    RTX_OPTION_ARGS("rtx.neuralUplift", float, workScale, 1.0f,
+                    "Fraction of the output resolution, per axis, that the network runs at (0.33-1). Its cost scales\n"
+                    "with the pixels it processes, so this is the pass's main performance control. At 1 it runs on the\n"
+                    "output directly, exactly as it did before this option existed. Below 1 the finished frame is\n"
+                    "downsampled to this size, enhanced there, and upsampled back to the output with a linear filter,\n"
+                    "which softens native detail in proportion. Depth and motion vectors are handed over unchanged;\n"
+                    "the snippet is told their real sizes as it already is. Changing it recreates the feature.",
+                    args.minValue = kNeuralUpliftMinWorkScale, args.maxValue = 1.0f,
+                    args.environment = "RTX_NEURAL_UPLIFT_WORK_SCALE",
+                    args.flags = RtxOptionFlags::UserSetting);
+
     RTX_OPTION_ARGS("rtx.neuralUplift", float, styleStrength, 1.0f,
                     "How far the selected style is blended in from neutral, 0-1. 0 makes any style a no-op; 1 applies\n"
                     "it fully. This is the parameter NVIDIA named DLSSNR.LocalToneStrength - it is not a tone control,\n"
@@ -212,6 +227,24 @@ namespace dxvk {
   private:
     void initializeFeature(Rc<DxvkContext> ctx, const VkExtent3D& outputExtent);
 
+    // workScale below 1: the network runs on a downsampled copy of the frame and the result is
+    // upsampled back into it. Returns whether the evaluation succeeded.
+    bool dispatchAtWorkScale(RtxContext* ctx,
+                             DxvkBarrierSet& barriers,
+                             const Resources::Resource& inOutColor,
+                             const Resources::Resource* depth,
+                             const Resources::Resource* motionVectors,
+                             const VkExtent3D& workExtent,
+                             bool resetHistory);
+
+    // Moves depth and motion vectors into the scope the snippet's compute work reads them in.
+    void acquireReadOnlyInputs(DxvkBarrierSet& barriers,
+                               const Resources::Resource* depth,
+                               const Resources::Resource* motionVectors) const;
+
+    // The down- and upsample are linear blits, which the colour format has to support.
+    bool supportsLinearBlit(VkFormat format) const;
+
     // Selects the depth resource the current options ask for, or null when it does not exist.
     const Resources::Resource* selectDepth(const Resources::RaytracingOutput& rtOutput) const;
 
@@ -251,7 +284,14 @@ namespace dxvk {
     // DLSSNR.Output, so the frame is copied here first.
     Resources::Resource m_intermediateColor;
 
+    // The network's input and output while workScale is below 1, both in the output's format. They
+    // are released while the pass runs at full size, and m_intermediateColor while it does not.
+    Resources::Resource m_workColor;
+    Resources::Resource m_workOutput;
+
     // Diagnostics for the developer panel.
+    // Size the network last ran at when below the output size; zero when it ran at full size.
+    VkExtent3D m_lastWorkExtent = { 0, 0, 0 };
     uint32_t m_initCount = 0;
     const char* m_statusReason = "not dispatched yet";
     // Which optional inputs the last dispatch actually had. Worth showing rather than assuming:
