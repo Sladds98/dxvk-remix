@@ -1,0 +1,67 @@
+# Attribution guard: the CI layer of the no-attribution rule (CLAUDE.md, "Attribution"). Fails a
+# pull request whose title, description, comments or owner-authored commits carry a co-author
+# line, a session link or a generated-by footer, and a push to main whose owner-authored commits
+# do. Other authors' commits (upstream syncs, cherry-picks) are reported as notices, since their
+# history is theirs and is never rewritten.
+#
+# Why a CI layer: the client-side layers (.githooks/commit-msg strips trailers from every local
+# commit; the `attribution` block in .claude/settings.json) act where the text is written. The
+# GitHub integration used to open pull requests appends its footer to the DESCRIPTION on
+# GitHub's side, after the text has left the machine. Only a check that reads the text back from
+# GitHub can see that, so it runs on `edited` too.
+#
+# Read-only by construction: pull-requests: read, never write. The fix for a red run is a human
+# edit (or, for a commit, a decision); the annotation says which.
+name: Attribution guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+
+concurrency:
+  group: attribution-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  attribution:
+    if: github.event_name != 'pull_request' || github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Commits authored by these addresses are held to the rule; see scripts/attribution-check.mjs.
+      ATTRIBUTION_OWNER_EMAILS: joe-sladden@hotmail.co.uk,280057690+Sladds98@users.noreply.github.com
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # the commit range needs both ends of the PR, not just the merge tip
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Self-test
+        run: node --test scripts/attribution-check.test.mjs
+      # Title and description arrive through env, never interpolated into the shell: a
+      # description is attacker-controlled text on a public repository and must not run.
+      - name: Pull request title and description
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/attribution-check.mjs pr
+      - name: Pull request comments and review comments
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/attribution-check.mjs comments "$PR_NUMBER"
+      - name: Commit messages and identities
+        if: always()
+        env:
+          RANGE_FROM: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          RANGE_TO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/attribution-check.mjs commits "$RANGE_FROM" "$RANGE_TO"

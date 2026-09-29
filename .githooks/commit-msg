@@ -1,0 +1,34 @@
+#!/bin/sh
+# commit-msg hook: strip any AI self-attribution / co-author trailers.
+#
+# Purpose: keep the git history clean of machine authorship credit (CLAUDE.md,
+# "Attribution"). Any line crediting Claude / Anthropic (or a generic AI
+# assistant) as co-author, generator, or session is removed automatically
+# before the commit is written.
+#
+# This runs on EVERY commit (git config core.hooksPath .githooks). It rewrites
+# the message in place rather than rejecting it, so the workflow never breaks —
+# offending lines just disappear.
+
+msg_file="$1"
+[ -f "$msg_file" ] || exit 0
+
+tmp_file="$msg_file.stripped"
+
+# Drop any line matching an attribution pattern (case-insensitive):
+#  - Co-authored-by: ... Claude / Anthropic
+#  - Claude-Session: / Claude-session URLs
+#  - "Generated with [Claude Code]" style credits (incl. the 🤖 variant)
+#  - any claude.ai/code link
+#  - generic "Co-authored-by: ... AI assistant" / "Generated with <AI>"
+grep -viE \
+  '^[[:space:]]*co-authored-by:.*(claude|anthropic|\[bot\]|ai assistant|agent)|^[[:space:]]*claude-session:|claude\.ai/code|generated with[[:space:]]*\[?claude|🤖[[:space:]]*generated with|assisted[- ]by:.*(claude|anthropic|ai)' \
+  "$msg_file" > "$tmp_file"
+
+# Collapse any trailing blank lines left behind by the removal.
+# (awk buffers blank lines and only emits them if more content follows.)
+awk 'NF{for(i=0;i<blanks;i++)print "";blanks=0;print;next}{blanks++}' \
+  "$tmp_file" > "$msg_file"
+
+rm -f "$tmp_file"
+exit 0

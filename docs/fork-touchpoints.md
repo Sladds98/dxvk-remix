@@ -40,6 +40,16 @@ check will enforce it if discipline slips.
 
 ---
 
+## .gitattributes
+
+**Category:** inline-tweak
+
+- **Inline tweak** at end of file — 2-line addition: `.githooks/* text eol=lf`, so the repo's
+  `commit-msg` / `pre-push` hooks keep LF line endings when Git for Windows checks out with
+  `core.autocrlf=true`. A CRLF shebang (`#!/bin/sh\r`) stops the hook from running.
+
+---
+
 ## public/include/remix/remix.h
 
 **Pre-refactor fork footprint:** +101 / -9 LOC (audit 2026-04-18)

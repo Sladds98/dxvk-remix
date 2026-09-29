@@ -43,6 +43,13 @@ want to make this fork better — you're in the right place.
    ```
    git remote add canonical https://github.com/RemixProjGroup/dxvk-remix.git
    ```
+4. *(Recommended)* Enable the repo's git hooks:
+   ```
+   git config core.hooksPath .githooks
+   ```
+   `commit-msg` strips AI co-author / generated-by lines from commit
+   messages, and `pre-push` refuses pushes to `main` and pushes that
+   would not fast-forward.
 
 The canonical repo's default branch is `modern-games-sdk-api`. Your
 fork has a tracking copy of that branch — it's where shipped work
