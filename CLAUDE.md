@@ -1,162 +1,102 @@
-# CLAUDE.md — agent entry point for Remix Plus
+# CLAUDE.md — Remix Plus
 
-This repo is **Remix Plus** — a port of NVIDIA's `dxvk-remix` focused
-on enabling **modern games to run through the Remix SDK API**, derived
-from the gmod-rtx community fork. It carries API surface, capture/
-replacement, hw-skinning, tonemap, and atmosphere work needed for
-API-driven game integrations. Unity is one such integration path
-among others; the port itself is not engine-specific.
+Remix Plus is a port of NVIDIA's `dxvk-remix` that lets **modern games run through the Remix
+SDK API**. It derives from the gmod-rtx community fork and carries API surface, capture /
+replacement, hw-skinning, tonemap and atmosphere work. It is not engine-specific; Unity is one
+integration path among several.
 
-Contributor-facing docs live in **`docs/`**. The contribution flow
-and fork discipline are documented in
-**[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)**. The authoritative
-inventory of every upstream file the fork touches is
-**[`docs/fork-touchpoints.md`](docs/fork-touchpoints.md)**.
+This repository is Joe's fork (`Sladds98/dxvk-remix`) of the canonical
+[`RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix). Contributor docs
+live in `docs/`: the contribution flow and fork discipline in
+[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md), and the inventory of every upstream file the fork
+touches in [`docs/fork-touchpoints.md`](docs/fork-touchpoints.md).
 
-## Repo structure — fork + PR model
+NVIDIA's upstream agent guide (coding standards, meson registration of new files, RTX option
+conventions, shader layout) applies here too: @AGENTS.md
 
-Classic GitHub **fork + PR** workflow:
+## Branches and pull requests
 
-**Canonical repo** — [`github.com/RemixProjGroup/dxvk-remix`](https://github.com/RemixProjGroup/dxvk-remix).
-Default branch is `main`.
+- `main` changes only by merging a pull request. Start each piece of work on a branch cut from
+  `main` (`git switch -c <name> origin/main`), push that branch, and open a PR into `main`. The PR
+  is where the Windows build runs and where Joe reviews, so nothing reaches `main` unbuilt.
+- Keep published history append-only: no force push (including `--force-with-lease`), no rebase
+  or amend of pushed commits. Bring a base branch in with a merge. Other people pull these
+  branches, and a rewrite breaks their checkouts.
+- `.githooks/pre-push` refuses pushes to `main` and pushes that would not fast-forward, and
+  GitHub's branch rules enforce the same on the server. Enable the repo hooks once per clone:
+  `git config core.hooksPath .githooks`. Leave hooks on (no `--no-verify`) unless Joe asks.
+- Other branch lines have their own base. `gta4-atmos-dlss5` is Kim2091's DLSS 5 / GTA IV line
+  (Neural Uplift lives there); it is hundreds of commits apart from `main`, so work meant for it
+  branches from it and its PR targets it.
+- Ask before pushing to a remote other people pull from: canonical `RemixProjGroup/dxvk-remix`
+  and `kim2091/dxvk-remix`.
+- Branch names are free-form. The maintainer's own convention is `unity-workstream/<NN>-<name>`.
+- Fill in `.github/PULL_REQUEST_TEMPLATE.md`; keep each PR to one change.
 
-**Personal forks** — anyone contributing forks the canonical repo.
-Each contributor's fork holds their own feature branches and a
-personal tracking copy of `main`.
+## Attribution
 
-For the full contribution flow (setup, branch conventions, build,
-discipline, PR submission), point contributors at
-[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+- Commits, PR titles and descriptions, review comments, code and docs carry no Claude
+  attribution: no co-author trailer, no generated-by footer, no claude.ai session link. Commits
+  in this fork are authored as `Joe Sladden <joe-sladden@hotmail.co.uk>`. (Joe's rule, 29 Sep
+  2026.)
+- Three layers enforce it: the `attribution` block in `.claude/settings.json`, the
+  `.githooks/commit-msg` hook that strips trailers, and the `Attribution guard` workflow
+  (`scripts/attribution-check.mjs`).
+- The GitHub integration appends a footer to PR descriptions on GitHub's side. After opening or
+  editing a PR, re-read its description and remove the footer.
+- Existing history stays as it is, including upstream contributors' commits that credit Claude.
+  The guard reports those as notices and holds only Joe's commits to the rule.
 
-## Fork discipline — read before editing upstream files
+## Fork discipline for upstream files
 
-The port uses a **fork-touchpoint pattern** to minimize rebase cost
-against upstream NVIDIA `dxvk-remix`. The pattern is documented in
-[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md). Short version:
+The fork minimises rebase cost against upstream NVIDIA `dxvk-remix`; `docs/CONTRIBUTING.md` has
+the full pattern.
 
-- **Prefer hooks over inline tweaks.** When adding fork logic to an
-  upstream file, extract the body into a `src/dxvk/rtx_render/rtx_fork_*.cpp`
-  module and leave a one-line dispatch into `fork_hooks::…` in the upstream
-  file. Fork-owned file naming: `rtx_fork_<subsystem>.cpp/h`.
-- **Inline tweaks are allowed but capped.** If a change is truly small
-  (< 20 LOC) and structurally can't be a hook (e.g. struct-field addition,
-  enum bit), inline is fine. Anything bigger should be refactored.
-- **Fridge-list invariant.** Every commit that touches an upstream file
-  MUST also update [`docs/fork-touchpoints.md`](docs/fork-touchpoints.md)
-  in the same commit. The PR template enforces this.
-- **Audit script.** Run `scripts/audit-fork-touchpoints.sh` before
+- Prefer a hook over an inline edit: put fork logic in a fork-owned
+  `src/dxvk/rtx_render/rtx_fork_<subsystem>.cpp/h` and leave a one-line `fork_hooks::…` call in the
+  upstream file.
+- Inline edits are fine when small (under ~20 lines) and structurally impossible as a hook, such
+  as a struct field or an enum bit.
+- A commit that touches an upstream file also updates `docs/fork-touchpoints.md` in the same
+  commit; the PR template checks for it. Run `scripts/audit-fork-touchpoints.sh` before
   committing upstream edits.
+- Leave `submodules/` and `external/` alone; they are third-party pins.
 
-## API documentation discipline — read before editing the API surface
+## API surface and generated docs
 
-The Remix C API is **the** integration contract for plugins and host
-applications. Any change to the surface MUST update the corresponding
-developer docs in the same commit. Reviewers should reject API-surface
-changes that ship without doc updates.
+- The Remix C API is the integration contract for plugins and hosts, so an API change ships with
+  its doc updates in the same commit. The detailed list of files and docs is in
+  `.claude/rules/api-surface.md`, which loads when you work on API files.
+- `RtxOptions.md` is generated: run Remix with `DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD=1` after
+  adding an `RTX_OPTION`, and commit the result. Where Remix cannot run (a Linux cloud session),
+  hand-add the row in the same format and say "regenerate in-app" in the commit message.
+- `RemixApiSurface.md` is generated from `public/include/remix/remix_c.h` by
+  `scripts-common/generate_remix_api_md.py`; regenerate with `scripts/regen-docs.ps1` rather than
+  editing it.
 
-The API surface is:
+## Building and verifying
 
-- **The C header** at
-  [`public/include/remix/remix_c.h`](public/include/remix/remix_c.h) —
-  every function pointer typedef, every `remixapi_*` struct / enum /
-  handle, every macro a consumer compiles against.
-- **The C++ wrapper** at
-  [`public/include/remix/remix.h`](public/include/remix/remix.h) — the
-  RAII / type-safe layer over the same surface.
-- **String-keyed conventions on top of the API:**
-  - `__<ns>.*` keys read by `SetGameValue` / `GetGameValue` (the
-    GameStateStore convention used by fork-side subsystems).
-  - `rtx.<ns>.*` ConfigVariable namespaces declared by fork-side
-    `rtx_fork_*` modules and intended as plugin-tuning surfaces (e.g.
-    `rtx.weather.preset.*`). Internal `rtx.*` knobs are auto-published
-    to `RtxOptions.md` and don't need separate doc work.
+- On Windows, build with the project skills: `rtx-build` for the runtime (64-bit `d3d9.dll`),
+  `bridge-build` for the bridge (32-bit client + 64-bit server). Ship only on exit code 0 with zero
+  compile errors.
+- A Linux cloud session cannot build this project. Open the PR and treat the `Build` workflow as
+  the compile check; its artifacts (`rtx-remix-for-x86-games-<run>-<sha>-<flavour>`) are what gets
+  installed for testing.
+- A task is done when the build is green, not when the code is written.
 
-Doc files to keep in sync:
+## Working with Joe
 
-- [`docs/RemixApi.md`](docs/RemixApi.md) — the hub reference. Update
-  when adding / removing / renaming fields on `remixapi_Interface`,
-  changing function signatures, adding `*EXT` structs, adding error
-  codes, or adding new format / category enum values.
-- [`docs/RemixApiChangelog.md`](docs/RemixApiChangelog.md) — every API
-  surface change gets a dated entry under the appropriate
-  `Added` / `Changed` / `Fixed` / `Removed` heading.
-- [`docs/RemixSDK.md`](docs/RemixSDK.md) — update only when the
-  high-level setup or mental model changes.
-- **Spoke pages** — when adding a new `__<ns>.*` GameStateStore
-  convention or fork-side `rtx.<ns>.*` namespace, add a matching
-  `docs/Remix<Ns>API.md` page (use
-  [`docs/RemixSkyAPI.md`](docs/RemixSkyAPI.md) as the
-  template) and add a row to the
-  [Convention namespaces](docs/RemixApi.md#convention-namespaces) table.
-
-Auto-generated docs (do not hand-edit):
-
-- [`RtxOptions.md`](RtxOptions.md) is regenerated by running Remix with
-  `DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD=1` set in the environment.
-  Re-run after adding any new `RTX_OPTION` and commit the regenerated
-  file.
-- [`RemixApiSurface.md`](RemixApiSurface.md) is auto-generated from
-  [`public/include/remix/remix_c.h`](public/include/remix/remix_c.h)
-  by [`scripts-common/generate_remix_api_md.py`](scripts-common/generate_remix_api_md.py).
-  Regenerate by running `scripts/regen-docs.ps1` from the repo root.
-  Do not hand-edit.
-
-The audit script does not currently enforce API-doc updates —
-discipline is on the author and the reviewer.
-
-## Branch conventions (personal fork)
-
-- `main` — primary development branch on canonical. Port work
-  lands here.
-- Feature branches — name them however you like on your fork. The
-  maintainer's internal convention is `unity-workstream/<NN>-<short-name>`
-  (e.g. `unity-workstream/05-hillaire-atmosphere`) — ad-hoc numbering,
-  not monotonic. Contributors are not required to follow this scheme;
-  see [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for guidance.
-
-## End-of-project checklist
-
-1. **Build** via the `rtx-build` skill (pre-cleans `nv-private/` +
-   `tests/rtx/dxvk_rt_testing/`, then `PerformBuild -release`).
-2. **Ship** only when exit code 0 and zero compile errors.
-3. **Author** commits as the human contributor in the repo's git
-   config. No AI co-author trailers unless explicitly requested.
-4. **Fast-forward only.** Never `--force`, never `--force-with-lease`
-   on `main`. If a push is rejected as non-ff, stop
-   and investigate.
-5. **Ask** before any push to a remote with downstream readers —
-   that includes canonical (`RemixProjGroup/dxvk-remix`) and any
-   maintainer's personal fork (`kim2091/dxvk-remix`) that contributors
-   pull from.
-
-## Project-local skills
-
-Reusable skills for this codebase live in **`.claude/skills/`**. Invoke
-via the `Skill` tool by name:
-
-- **`rtx-build`** — wraps the proper meson/ninja build with the
-  required `nv-private/` + `tests/rtx/dxvk_rt_testing/` pre-cleanup,
-  runs in the background, reports exit code + error count. Use
-  whenever the user asks to build or compile-check the runtime.
-- **`bridge-build`** — wraps `bridge/build_bridge_release.bat` (x64
-  server + x86 client). Verifies all three artifacts (`NvRemixBridge.exe`,
-  `d3d9.dll`, `NvRemixLauncher32.exe`) exist and flags mixed-date
-  binaries (IPC ABI risk). Use whenever the user asks to build the
-  bridge specifically.
-
-## Don't
-
-- Don't force-push anything, ever.
-- Don't skip hooks (`--no-verify`) unless explicitly asked.
-- Don't add a feature, refactor, or "cleanup" beyond the task scope.
-- Don't edit files under `submodules/` or `external/` — those are
-  third-party pins.
+- Explain in plain language and back claims with evidence (log lines, CI output, code
+  references) rather than guesses. Say plainly when something failed or was skipped.
+- Do what the task asks. Suggest adjacent features, refactors or cleanups separately rather than
+  folding them into the change.
+- Game-side steps (installing builds, editing game configs, reading game logs) happen on Joe's PC
+  through his Cowork session. Hand those over as a clear, copy-pasteable block rather than asking
+  Joe to do them by hand.
 
 ## Gmod reference repo
 
-Read-only source for porting features from the upstream gmod-rtx
-community fork. Branches of note: `origin/unity` (the port's baseline —
-named after the gmod branch, carries the Remix API / capture /
-hw-skinning / atmosphere work that matters for modern-game integrations),
-`origin/gmod-ex` (Garry's Mod game-specific — usually out-of-scope).
-Never commit or push to this repo.
+The upstream gmod-rtx community fork is a read-only source for porting features. `origin/unity`
+is the port's baseline (Remix API, capture, hw-skinning and atmosphere work);
+`origin/gmod-ex` is Garry's Mod–specific and usually out of scope. Read from it only; it takes
+no commits or pushes from here.
