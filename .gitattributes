@@ -30,3 +30,6 @@
 # Note: Missing from buit-in linguist extensions for some reason, treat .comp
 # the same as other GLSL files such as .vert and .frag.
 *.comp linguist-language=GLSL
+
+# Repo git hooks run under sh on every platform; a CRLF checkout breaks their shebang.
+.githooks/* text eol=lf
