@@ -1,12 +1,10 @@
 name: Build
 
 on:
-  workflow_dispatch: {}
-
   push:
-    branches: [ main, 'release/**' ]
+    branches: [ main, 'release/**', gta4-atmos-dlss5 ]
   pull_request:
-    branches: [ main, 'release/**' ]
+    branches: [ main, 'release/**', gta4-atmos-dlss5 ]
   # Manual build trigger: publishing a GitHub Release (typically from
   # modern-games-sdk-api) fires the workflow. Also enables
   # workflow_dispatch so the Actions UI "Run workflow" button works.
@@ -22,11 +20,9 @@ jobs:
 
     strategy:
       matrix:
+        # Release only on this fork: it is the flavour that gets installed, and each Windows
+        # build takes a long time. Add debug / debugoptimized back here when a crash needs them.
         include:
-          - build-flavour: debug
-            output-subdir: _Comp64Debug
-          - build-flavour: debugoptimized
-            output-subdir: _Comp64DebugOptimized
           - build-flavour: release
             output-subdir: _Comp64Release
 
