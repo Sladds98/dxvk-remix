@@ -49,7 +49,7 @@ test('strips the footer block the integration appends and keeps the prose', () =
 test('parses owner emails and commit identities', () => {
   assert.deepEqual(ownerEmails(' Joe-Sladden@hotmail.co.uk, 1+x@users.noreply.github.com ,'),
     ['joe-sladden@hotmail.co.uk', '1+x@users.noreply.github.com'])
-  assert.deepEqual(ownerEmails(undefined), [])
+  assert.deepEqual(ownerEmails(''), [])
   assert.equal(emailOf('Joe Sladden <Joe-Sladden@hotmail.co.uk>'), 'joe-sladden@hotmail.co.uk')
   assert.equal(emailOf('no email here'), '')
 })
